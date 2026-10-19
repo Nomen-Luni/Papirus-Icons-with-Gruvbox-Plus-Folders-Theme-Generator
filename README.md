@@ -17,7 +17,9 @@ Use `--overlay` for a folder-only theme that inherits Papirus Dark instead. Use 
 ## Acknowledgements
 
 - **Papirus Dark:** the [Papirus Development Team and contributors](https://github.com/PapirusDevelopmentTeam/papirus-icon-theme), whose theme builds on the [Paper Icon Set](https://github.com/snwh/paper-icon-theme).
-- **Gruvbox Dark folder artwork:** the authors and contributors of the installed Gruvbox icon theme. Several Gruvbox icon packs exist; consult your installed theme's credits for its specific authors.
+- **Gruvbox Plus folder artwork:** [SylEleuth](https://github.com/SylEleuth/gruvbox-plus-icon-pack).
 - **Original Gruvbox colour scheme:** [morhetz (Pavel Pertsev)](https://github.com/morhetz/gruvbox).
 
-All credit for the original icon artwork belongs to its respective creators. The artwork remains subject to its original licences; this script does not change them.
+All credit for the original icon artwork belongs to its respective creators. The artwork remains subject to its original licences; this script does not change theme.
+
+The generated icon set is covered by the GPL-3.0 licence in accordance with the licencing of the icon sets from which it is derived.
