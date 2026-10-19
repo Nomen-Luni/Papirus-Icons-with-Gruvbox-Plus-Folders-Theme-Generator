@@ -3,9 +3,8 @@
 
 Run: python3 build_icon_theme.py
 Then select 'Papirus Dark with Gruvbox folders' in KDE's icon settings.
-Rerun after theme updates to discover added/removed icons and refresh folders.
-Existing Papirus files update through symlinks. Source themes are never modified.
-Use --overlay for a smaller folder-only theme with Inherits=Papirus-Dark.
+The output contains folder overrides and inherits the installed Papirus theme.
+Rerun after Gruvbox updates to refresh folders. Source themes are never modified.
 Use --gruvbox /path/to/theme and --papirus /path/to/theme if detection is ambiguous.
 Only output previously created by this script can be replaced. No sudo needed.
 """
@@ -20,9 +19,16 @@ import sys
 import tempfile
 
 MARKER = '.generated-icon-theme.json'
+# Keep the original marker identity so existing v1 outputs can be rebuilt.
 GENERATOR = 'papirus-gruvbox-builder-v1'
 EXTENSIONS = {'.svg', '.png', '.xpm', '.svgz'}
-SPECIAL = {'user-home', 'user-desktop', 'inode-directory'}
+# Explicit aliases only: a generic network/application icon must not become an
+# override merely because its symlink happens to point at folder artwork.
+SPECIAL = {
+    'user-home', 'user-home-open', 'user-desktop', 'inode-directory',
+    'gtk-directory', 'gtk-home', 'gnome-fs-directory', 'gnome-fs-home',
+    'gnome-home', 'stock_folder', 'stock_home',
+}
 
 
 def config(path):
@@ -30,6 +36,8 @@ def config(path):
     parser.optionxform = str
     with path.open(encoding='utf-8-sig') as stream:
         parser.read_file(stream)
+    if not parser.has_section('Icon Theme'):
+        raise ValueError('Missing [Icon Theme] in ' + str(path))
     return parser
 
 
@@ -38,9 +46,13 @@ def split(value):
 
 
 def roots():
-    paths = [Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share'))) / 'icons',
-             Path.home() / '.icons']
-    paths += [Path(x) / 'icons' for x in os.environ.get('XDG_DATA_DIRS', '/usr/local/share:/usr/share').split(':') if x]
+    # Empty XDG variables mean defaults; relative XDG paths are invalid.
+    home = os.environ.get('XDG_DATA_HOME') or str(Path.home() / '.local/share')
+    if not Path(home).is_absolute():
+        home = str(Path.home() / '.local/share')
+    paths = [Path(home) / 'icons', Path.home() / '.icons']
+    system = os.environ.get('XDG_DATA_DIRS') or '/usr/local/share:/usr/share'
+    paths += [Path(x) / 'icons' for x in system.split(':') if Path(x).is_absolute()]
     return list(dict.fromkeys(p.absolute() for p in paths))
 
 
@@ -59,64 +71,42 @@ def choose(themes, explicit, kind):
         path = Path(explicit).expanduser().absolute()
         if not (path / 'index.theme').is_file():
             raise ValueError('No index.theme in ' + str(path))
-        themes[path.name] = path
         return path
-    exact = 'Papirus-Dark' if kind == 'papirus' else 'Gruvbox-Dark'
-    if exact in themes:
-        return themes[exact]
-    candidates = []
-    for path in themes.values():
+    # Generated outputs contain both source names in their display name, and
+    # must never be mistaken for a source on subsequent runs.
+    candidates = {name: path for name, path in themes.items()
+                  if not (path / MARKER).exists()}
+    exact = ('Papirus-Dark',) if kind == 'papirus' else ('Gruvbox-Plus-Dark', 'Gruvbox-Dark')
+    for name in exact:
+        if name in candidates:
+            return candidates[name]
+    matches = []
+    for path in candidates.values():
         display = config(path / 'index.theme').get('Icon Theme', 'Name', fallback='')
         label = (path.name + ' ' + display).lower()
         if kind in label and 'dark' in label:
-            candidates.append(path)
-    if len(candidates) != 1:
+            matches.append(path)
+    if len(matches) != 1:
         raise ValueError('Cannot uniquely detect ' + kind + ' dark. Candidates: ' +
-                         ', '.join(str(x) for x in candidates) +
+                         ', '.join(str(x) for x in matches) +
                          '. Specify --' + kind + ' /path/to/theme')
-    return candidates[0]
+    return matches[0]
 
 
-def chain(start, themes, search):
-    """Depth-first theme inheritance, with cycle protection and hicolor last."""
-    result, seen = [], set()
-    def visit(path):
-        if path.name in seen:
-            return
-        seen.add(path.name)
-        cfg = config(path / 'index.theme')
-        locations = [path] + [base / path.name for base in search
-                             if (base / path.name).is_dir() and base / path.name != path]
-        result.append((path, cfg, locations))
-        for parent in split(cfg.get('Icon Theme', 'Inherits', fallback='')):
-            if parent == 'hicolor':
-                continue
-            if parent in themes:
-                visit(themes[parent])
-            else:
-                print('Warning: missing inherited theme ' + parent, file=sys.stderr)
-    visit(start)
-    if 'hicolor' in themes and start.name != 'hicolor':
-        visit(themes['hicolor'])
-    return result
-
-
-def entries(theme):
-    """Read declared directories, including symlinked directories and aliases.
-
-    Unlisted directories are ignored, as they are by theme loaders. Inventing
-    size metadata for those directories would change theme semantics.
-    """
+def entries(theme, accept=None):
+    """Read declared directories, respecting search priority and valid aliases."""
     path, cfg, locations = theme
     names = split(cfg.get('Icon Theme', 'Directories', fallback=''))
     names += split(cfg.get('Icon Theme', 'ScaledDirectories', fallback=''))
     for directory in dict.fromkeys(names):
         rel = Path(directory)
-        if rel.is_absolute() or '..' in rel.parts or not cfg.has_section(directory):
+        if (not rel.parts or rel.is_absolute() or '..' in rel.parts or
+                str(rel) != directory or not cfg.has_section(directory)):
             raise ValueError('Invalid directory metadata: ' + str(path) + ': ' + directory)
         meta = dict(cfg[directory])
-        if 'Size' not in meta:
-            raise ValueError('Missing Size for ' + directory + ' in ' + str(path))
+        for key in ('Size', 'Scale'):
+            if int(meta.get(key, '1' if key == 'Scale' else '0')) <= 0:
+                raise ValueError('Invalid ' + key + ' for ' + directory + ' in ' + str(path))
         found = set()
         for location in locations:
             source = location / rel
@@ -125,7 +115,8 @@ def entries(theme):
             for icon in sorted(source.iterdir()):
                 if icon.suffix.lower() not in EXTENSIONS or icon.name in found:
                     continue
-                found.add(icon.name)
+                if accept is not None and not accept(icon, meta):
+                    continue
                 try:
                     target = icon.resolve(strict=True)
                     if not target.is_file():
@@ -133,45 +124,79 @@ def entries(theme):
                 except (OSError, RuntimeError):
                     print('Warning: skipping broken/cyclic link ' + str(icon), file=sys.stderr)
                     continue
+                # A broken alias in an earlier root must not hide a valid file.
+                found.add(icon.name)
                 yield directory, meta, icon, target
 
 
-def folder_icon(icon, target, meta):
-    # Follow aliases such as inode-directory -> folder.svg and folder symlinks
-    # which point into a colour-specific directory outside the declared tree.
-    names = {icon.stem, target.stem}
-    return any(name == 'folder' or name.startswith('folder-') or
-               name in SPECIAL for name in names)
+def folder_icon(icon, meta):
+    # Follow the target when copying artwork, but classify by the requested name.
+    # Context prevents an application called folder-* from replacing an app icon.
+    name = icon.stem
+    plain = name[:-9] if name.endswith('-symbolic') else name
+    context = meta.get('Context', '').lower()
+    if plain in SPECIAL:
+        return context in {'places', 'mimetypes'}
+    return (plain == 'folder' or plain.startswith('folder-')) and context in {'places', 'actions'}
+
+
+def validate_destination(destination):
+    if destination.name in {'.', '..'} or not re.fullmatch(r'[A-Za-z0-9_.-]+', destination.name):
+        raise ValueError('Output theme directory must use ASCII letters, numbers, dots, underscores or hyphens')
+    if destination.is_symlink():
+        raise ValueError('Refusing symlink output directory')
+    if destination.exists():
+        marker = destination / MARKER
+        try:
+            data = json.loads(marker.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            data = None
+        if not isinstance(data, dict) or data.get('generator') != GENERATOR:
+            raise ValueError('Refusing to replace a directory not created by this script')
 
 
 def build(args):
     search = roots()
     themes = discover(search)
-    gruv = choose(themes, args.gruvbox, 'gruvbox')
-    pap = choose(themes, args.papirus, 'papirus')
     destination = (Path(args.output).expanduser().absolute() if args.output else
                    search[0] / 'Papirus-Gruvbox-Folders')
-    if not re.fullmatch(r'[A-Za-z0-9_.-]+', destination.name):
-        raise ValueError('Output theme directory must use ASCII letters, numbers, dots, underscores or hyphens')
-    for source in list(themes.values()):
+    validate_destination(destination)
+    # Ignore the existing output for detection, but still validate explicit inputs.
+    candidates = {name: path for name, path in themes.items()
+                  if path.resolve() != destination.resolve()}
+    gruv = choose(candidates, args.gruvbox, 'gruvbox')
+    pap = choose(candidates, args.papirus, 'papirus')
+    for source in list(candidates.values()) + [gruv, pap]:
         src, dst = source.resolve(), destination.resolve()
         if src == dst or src in dst.parents or dst in src.parents:
             raise ValueError('Output must be separate from every source theme')
-    if destination.is_symlink():
-        raise ValueError('Refusing symlink output directory')
-    if destination.exists():
-        marker = destination / MARKER
-        if not marker.is_file() or json.loads(marker.read_text()).get('generator') != GENERATOR:
-            raise ValueError('Refusing to replace a directory not created by this script')
-    # Gruvbox is intentionally read directly: missing Gruvbox folder variants
-    # should come from Papirus rather than an unrelated Gruvbox parent theme.
-    donor = list(entries((gruv, config(gruv / 'index.theme'),
-                          [gruv] + [b / gruv.name for b in search if (b / gruv.name).is_dir() and b / gruv.name != gruv])))
-    donor = [item for item in donor if folder_icon(item[2], item[3], item[1])]
+    if destination.name in {gruv.name, pap.name}:
+        raise ValueError('Output must have a different theme name from its sources')
+    # Inherits resolves an installed theme name, not an arbitrary filesystem path.
+    visible_pap = themes.get(pap.name)
+    if visible_pap is None or visible_pap.resolve() != pap.resolve():
+        raise ValueError('Papirus must be installed in an icon search directory and not '
+                         'shadowed by another theme of the same name: ' + str(pap))
+    pap_cfg = config(pap / 'index.theme')
+    gruv_cfg = config(gruv / 'index.theme')
+    # Do not flatten parents: KDE must retain its own lookup and fallback rules.
+    # Check that the new inheritance edge cannot create a cycle through output.
+    seen = set()
+    def check_parents(path):
+        if path.name in seen:
+            return
+        seen.add(path.name)
+        for parent in split(config(path / 'index.theme').get('Icon Theme', 'Inherits', fallback='')):
+            if parent == destination.name:
+                raise ValueError('Papirus inheritance would create a cycle through the output theme')
+            if parent in themes:
+                check_parents(themes[parent])
+    check_parents(pap)
+    locations = [gruv] + [b / gruv.name for b in search
+                         if (b / gruv.name).is_dir() and (b / gruv.name).resolve() != gruv.resolve()]
+    donor = list(entries((gruv, gruv_cfg, locations), accept=folder_icon))
     if not donor:
-        raise ValueError('No Gruvbox folder icons found in declared directories')
-    override_names = {item[2].stem for item in donor}
-    layers = [] if args.overlay else chain(pap, themes, search)
+        raise ValueError('No Gruvbox folder icons found in declared Places/Actions/MimeTypes directories')
     print('Gruvbox:', gruv)
     print('Papirus:', pap)
     print('Output: ', destination)
@@ -180,50 +205,38 @@ def build(args):
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix='.' + destination.name + '-', dir=destination.parent))
-    counts = {'folders': 0, 'linked': 0}
     try:
         out = configparser.ConfigParser(interpolation=None)
         out.optionxform = str
-        out['Icon Theme'] = {'Name': 'Papirus Dark with Gruvbox folders',
-                             'Comment': 'Generated Gruvbox folders and live Papirus icons',
-                             'Inherits': pap.name if args.overlay else 'hicolor'}
-        directories = []
-        def emit(prefix, item, copy):
-            directory, meta, icon, target = item
-            subdir = prefix + '/' + directory
+        # Preserve KDE colour-scheme and size preferences, but not Papirus's
+        # translated identity, directory inventory or inheritance declaration.
+        excluded = {'Name', 'Comment', 'Inherits', 'Directories', 'ScaledDirectories', 'Hidden', 'Example'}
+        out['Icon Theme'] = {key: value for key, value in pap_cfg['Icon Theme'].items()
+                             if key.split('[', 1)[0] not in excluded}
+        out['Icon Theme'].update({'Name': 'Papirus Dark with Gruvbox folders',
+                                 'Comment': 'Generated Gruvbox folder overrides; inherits Papirus',
+                                 'Inherits': pap.name, 'Example': 'folder'})
+        directories, scaled_directories = [], []
+        scaled = set(split(gruv_cfg.get('Icon Theme', 'ScaledDirectories', fallback='')))
+        for directory, meta, icon, target in donor:
+            subdir = 'folders/' + directory
             if subdir not in out:
                 out[subdir] = meta
-                directories.append(subdir)
+                (scaled_directories if directory in scaled else directories).append(subdir)
             dest = staging / subdir / icon.name
             dest.parent.mkdir(parents=True, exist_ok=True)
-            if copy:
-                shutil.copyfile(target, dest)
-            else:
-                # Link the original alias path, not its current resolved target:
-                # upstream updates can retarget that alias without a rebuild.
-                dest.symlink_to(icon.absolute())
+            shutil.copyfile(target, dest)
             sidecar = icon.with_suffix('.icon')
             if sidecar.is_file():
                 shutil.copyfile(sidecar, dest.with_suffix('.icon'))
-        for item in donor:
-            emit('folders', item, True)
-            counts['folders'] += 1
-        claimed = set(override_names)
-        for number, layer in enumerate(layers):
-            items = list(entries(layer))
-            # Inheritance selects an icon name from the first theme containing
-            # it, regardless of size. Preserve that when flattening the tree.
-            accepted = [item for item in items if item[2].stem not in claimed]
-            for item in accepted:
-                emit('base-' + str(number), item, False)
-                counts['linked'] += 1
-            claimed.update(item[2].stem for item in items)
         out['Icon Theme']['Directories'] = ','.join(directories)
+        if scaled_directories:
+            out['Icon Theme']['ScaledDirectories'] = ','.join(scaled_directories)
         with (staging / 'index.theme').open('w', encoding='utf-8') as stream:
             out.write(stream, space_around_delimiters=False)
-        (staging / MARKER).write_text(json.dumps({'generator': GENERATOR,
-            'gruvbox': str(gruv), 'papirus': str(pap), 'overlay': args.overlay,
-            'counts': counts}, indent=2) + '\n')
+        (staging / MARKER).write_text(json.dumps({'generator': GENERATOR, 'format_version': 2,
+            'gruvbox': str(gruv), 'papirus': str(pap), 'overlay': True,
+            'counts': {'folders': len(donor), 'linked': 0}}, indent=2) + '\n', encoding='utf-8')
         backup = None
         if destination.exists():
             backup = Path(tempfile.mkdtemp(prefix='.' + destination.name + '-backup-', dir=destination.parent))
@@ -240,18 +253,21 @@ def build(args):
     finally:
         if staging.exists():
             shutil.rmtree(staging)
-    print('Installed:', counts['folders'], 'folder files;', counts['linked'], 'linked base files.')
+    print('Installed:', len(donor), 'folder files; other icons inherit from', pap.name + '.')
     print('Select "Papirus Dark with Gruvbox folders" in System Settings > Icons.')
-    print('Restart apps if needed. Rerun this script after theme updates to refresh the inventory.')
+    print('Restart apps or log out and back in if they retain old icons.')
+    print('Rerun after Gruvbox updates to refresh folders. Papirus updates are inherited automatically.')
+    if destination.parent not in search:
+        print('Warning: output is outside the icon search directories; install it before selecting it.', file=sys.stderr)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--gruvbox', help='Gruvbox Dark theme directory')
-    parser.add_argument('--papirus', help='Papirus Dark theme directory')
+    parser.add_argument('--papirus', help='Installed Papirus Dark theme directory')
     parser.add_argument('--output', help='Destination theme directory')
-    parser.add_argument('--overlay', action='store_true', help='Copy folders only; inherit all other icons from Papirus Dark')
-    parser.add_argument('--dry-run', action='store_true', help='Detect themes and folders without writing anything')
+    parser.add_argument('--overlay', action='store_true', help='Compatibility option: folder-only overlay is now always used')
+    parser.add_argument('--dry-run', action='store_true', help='Validate themes and folders without writing anything')
     args = parser.parse_args()
     try:
         build(args)
