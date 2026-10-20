@@ -1,7 +1,5 @@
 # Generator Script to Produce a Theme with Papirus Dark Icons but with Grubox+ Dark Folder Icons
 
-A Python script that combines Gruvbox Dark folder icons with Papirus Dark's remaining icons.
-
 ## AI Statement
 **This software was generated using ChatGPT.** I have cast an eye over the code but don't claim to have done a deep review. As with all free software - use at your own risk.
 
